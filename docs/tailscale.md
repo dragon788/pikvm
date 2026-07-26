@@ -69,11 +69,12 @@ PiKVM uses self-signed SSL certificates out of the box. You can also use
 [Tailscale certificates](https://tailscale.com/kb/1153/enabling-https) in place of the default one.
 
 !!! warning
-    Tailscale certificates are provided by Let's Encrypt and has a default
+    Tailscale certificates are provided by Let's Encrypt and have a default
     [expiry of 90 days](https://letsencrypt.org/2015/11/09/why-90-days/).
-    There is currently no mechanism available to auto-renew Tailscale
-    certificate. You may put the commands below in a script to simplify
-    process.
+    For automatic renewal, see [Automated Renewal Using Persistent Storage
+    (PST)](#automated-renewal-using-persistent-storage-pst) below.
+    The manual steps in this section are useful for a one-time setup or
+    if you prefer not to use the automated approach.
 
 1. Switch filesystem to RW if in ReadOnly mode and delete existing PiKVM certificates for nginx and vnc.
 
@@ -241,6 +242,225 @@ WantedBy=multi-user.target
 3. overlay is mounted with `/root/tailscale-state` as lowerdir
 4. overlay bind-mounted to `/var/lib/tailscale`
 5. `tailscaled.service` starts with writable state
+
+-----
+
+## Automated Renewal Using Persistent Storage (PST)
+
+An alternative to the overlay approach above is to store Tailscale
+certificates on PiKVM's [persistent storage (PST)](pst.md) partition
+and use a systemd timer for automatic renewal. This avoids
+tmpfs/overlayfs entirely.
+
+!!! warning "Use `kvmd-pstrun`, not a manual remount"
+    Always write to PST through `kvmd-pstrun -- <command>`, never by
+    calling `kvmd-helper-pst-remount rw`/`ro` yourself. The `kvmd-pst`
+    daemon reference-counts access and keeps the partition writable only
+    while a client needs it — a manual remount races with any other PST
+    user (for example the KVM switch settings writer or a certbot job)
+    and one caller's `ro` can pull the mount out from under another
+    mid-write. `kvmd-pstrun` remounts RW for the duration of your
+    command and drops back to RO automatically when it exits.
+
+The `tailscale cert` command is safe to run repeatedly — if the
+certificate is still valid, it exits immediately without contacting
+Let's Encrypt, so there is no risk of hitting rate limits.
+
+### Setup
+
+1. Create a directory for the certificates on the PST partition:
+
+    ```console
+    [root@pikvm ~]# kvmd-pstrun -- mkdir -p /var/lib/kvmd/pst/data/tailscale-certs
+    ```
+
+2. Generate the initial certificate. Replace `<tailscale_hostname>`
+    with your PiKVM's Tailscale FQDN (e.g.
+    `mypikvm.my-tailnet.ts.net`). If you are unsure, run
+    `tailscale cert` with no arguments and it will show the correct
+    domain.
+
+    ```console
+    [root@pikvm ~]# CERT_DIR=/var/lib/kvmd/pst/data/tailscale-certs
+    [root@pikvm ~]# kvmd-pstrun -- tailscale cert \
+        --cert-file "$CERT_DIR/<tailscale_hostname>.crt" \
+        --key-file "$CERT_DIR/<tailscale_hostname>.key" \
+        <tailscale_hostname>
+    [root@pikvm ~]# kvmd-pstrun -- chown :kvmd-nginx "$CERT_DIR"/<tailscale_hostname>.{crt,key}
+    [root@pikvm ~]# kvmd-pstrun -- chmod 644 "$CERT_DIR/<tailscale_hostname>.crt"
+    [root@pikvm ~]# kvmd-pstrun -- chmod 640 "$CERT_DIR/<tailscale_hostname>.key"
+    ```
+
+3. Replace the default self-signed certificates with symlinks to the
+    PST-stored certificates. These symlinks live under `/etc` on the
+    **root** filesystem (not PST), so this step uses the normal
+    `rw`/`ro` root remount and only needs to be done once:
+
+    ```console
+    [root@pikvm ~]# rw
+    [root@pikvm ~]# rm -f /etc/kvmd/nginx/ssl/server.{crt,key}
+    [root@pikvm ~]# ln -s /var/lib/kvmd/pst/data/tailscale-certs/<tailscale_hostname>.crt /etc/kvmd/nginx/ssl/server.crt
+    [root@pikvm ~]# ln -s /var/lib/kvmd/pst/data/tailscale-certs/<tailscale_hostname>.key /etc/kvmd/nginx/ssl/server.key
+    [root@pikvm ~]# chown -h :kvmd-nginx /etc/kvmd/nginx/ssl/server.{crt,key}
+    ```
+
+    Repeat for VNC if you have configured it:
+
+    ```console
+    [root@pikvm ~]# rm -f /etc/kvmd/vnc/ssl/server.{crt,key}
+    [root@pikvm ~]# ln -s /var/lib/kvmd/pst/data/tailscale-certs/<tailscale_hostname>.crt /etc/kvmd/vnc/ssl/server.crt
+    [root@pikvm ~]# ln -s /var/lib/kvmd/pst/data/tailscale-certs/<tailscale_hostname>.key /etc/kvmd/vnc/ssl/server.key
+    [root@pikvm ~]# chown -h :kvmd-vnc /etc/kvmd/vnc/ssl/server.{crt,key}
+    ```
+
+    Leave the root filesystem in RW mode for now — the remaining setup
+    steps also write to it. You will switch back to RO at the end.
+
+4. Create the renewal script. Save as
+    `/usr/local/bin/renew-tailscale-cert.sh`:
+
+    ```bash
+    #!/bin/bash
+    set -euo pipefail
+
+    # Your PiKVM's Tailscale FQDN, e.g. mypikvm.my-tailnet.ts.net
+    # Recommended: set it explicitly. Leave empty to auto-detect.
+    FQDN=""
+
+    export CERT_DIR=/var/lib/kvmd/pst/data/tailscale-certs
+
+    if [ -z "$FQDN" ]; then
+        # Self.DNSName from Tailscale's own status output, minus the
+        # trailing dot. Uses jq when available, otherwise falls back.
+        if command -v jq >/dev/null; then
+            FQDN=$(tailscale status --json | jq -r '.Self.DNSName')
+        else
+            FQDN=$(tailscale status --json \
+                | grep -m1 -o '"DNSName"[^"]*"[^"]*"' | cut -d'"' -f4)
+        fi
+        FQDN=${FQDN%.}
+    fi
+
+    case "$FQDN" in
+        *.ts.net) ;;
+        *)
+            echo "ERROR: could not determine Tailscale FQDN." >&2
+            echo "Set FQDN manually at the top of this script." >&2
+            exit 1
+            ;;
+    esac
+    export FQDN
+
+    # Write to PST through the kvmd-pst daemon (race-safe RW remount).
+    # tailscale cert resets ownership/mode on overwrite, so re-apply
+    # them in the same session while the partition is writable.
+    kvmd-pstrun -- bash -c '
+        set -e
+        tailscale cert \
+            --cert-file "$CERT_DIR/$FQDN.crt" \
+            --key-file "$CERT_DIR/$FQDN.key" \
+            "$FQDN"
+        chown :kvmd-nginx "$CERT_DIR/$FQDN.crt" "$CERT_DIR/$FQDN.key"
+        chmod 644 "$CERT_DIR/$FQDN.crt"
+        chmod 640 "$CERT_DIR/$FQDN.key"
+    '
+
+    systemctl restart kvmd-nginx kvmd-vnc
+    echo "Cert renewed for $FQDN"
+    ```
+
+    Make it executable:
+
+    ```console
+    [root@pikvm ~]# chmod +x /usr/local/bin/renew-tailscale-cert.sh
+    ```
+
+5. Create the systemd service. Save as
+    `/etc/systemd/system/renew-tailscale-cert.service`:
+
+    ```ini
+    [Unit]
+    Description=Renew Tailscale TLS certificate
+    After=network-online.target tailscaled.service
+    Requires=tailscaled.service
+    Wants=network-online.target
+
+    [Service]
+    Type=oneshot
+    ExecStart=/usr/local/bin/renew-tailscale-cert.sh
+
+    [Install]
+    WantedBy=multi-user.target
+    ```
+
+6. Create the systemd timer for weekly renewal. Save as
+    `/etc/systemd/system/renew-tailscale-cert.timer`:
+
+    ```ini
+    [Unit]
+    Description=Tailscale TLS certificate renewal (weekly)
+
+    [Timer]
+    OnCalendar=weekly
+    RandomizedDelaySec=3600
+    Persistent=true
+
+    [Install]
+    WantedBy=timers.target
+    ```
+
+7. Enable everything, then switch the root filesystem back to
+    read-only:
+
+    ```console
+    [root@pikvm ~]# systemctl daemon-reload
+    [root@pikvm ~]# systemctl enable renew-tailscale-cert.service
+    [root@pikvm ~]# systemctl enable renew-tailscale-cert.timer
+    [root@pikvm ~]# ro
+    ```
+
+The service runs at boot (after `tailscaled` and networking are up)
+and the timer triggers a weekly renewal. Since `tailscale cert` is a
+no-op when the certificate is still valid, this will only contact
+Let's Encrypt when the certificate is approaching expiry.
+
+!!! note
+    The `Persistent=true` option on the timer ensures that if PiKVM
+    was powered off when a scheduled renewal was due, the renewal
+    will run at the next boot.
+
+-----
+
+## NFS Root Filesystem
+
+!!! note
+    This section applies only to uncommon custom setups where PiKVM's
+    root filesystem is served over NFS. Most users can skip it.
+
+If your PiKVM boots from an NFS root, the read-only constraint that
+motivates both the overlayfs and PST approaches above does not apply
+— the NFS-mounted root is already writable. However, there are still
+a few things to be aware of.
+
+**Tailscale state** (`/var/lib/tailscale`) can be written directly on
+an NFS root without any overlay or remount steps. The overlayfs
+workaround is not needed.
+
+**Certificate renewal** can similarly write directly to any path on
+the NFS share. The `tailscale cert` command and the systemd timer from
+the PST section above still apply, but you can skip the `kvmd-pstrun`
+wrapper and write certs to any persistent path you prefer (e.g.
+`/etc/kvmd/tailscale-certs/`) — point `CERT_DIR` in the renewal script
+there and invoke `tailscale cert` directly instead of through
+`kvmd-pstrun`.
+
+**Overlayfs on NFS lowerdirs** is not supported on older kernels and
+should be avoided regardless. If you are using NFS root and attempted
+the overlayfs approach, switch to direct writes instead.
+
+**`rw`/`ro` commands** may behave differently or not apply at all
+depending on how your NFS root is configured. Check your specific
+setup before following any steps that call `rw` or `ro`.
 
 -----
 
